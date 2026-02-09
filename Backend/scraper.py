@@ -2,27 +2,90 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import traceback
+import gzip
+import zlib
+import subprocess
+import shutil
 
-# Browser Headers (Good practice, even for RSS)
+# --- STRATEGY 1: MASQUERADE AS IE 11 ---
+# IE 11 does not support Brotli (br), so the server MUST send gzip or deflate.
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko',
+    'Accept': 'text/html, application/xhtml+xml, */*',
+    'Accept-Encoding': 'gzip, deflate', # Explicitly exclude 'br'
+    'Connection': 'Keep-Alive'
 }
+
+def decode_content(response):
+    """
+    Decodes response content handling Gzip, Deflate, and Brotli manually if needed.
+    """
+    content = response.content
+    
+    # 1. Try standard decoding (requests usually handles gzip/deflate auto-magically)
+    try:
+        text = response.text
+        if text.strip().startswith("<?xml") or "<rss" in text or "<html" in text:
+            return text
+    except:
+        pass
+
+    print("WARNING: Standard decode failed. Checking compressed signatures...")
+    
+    # 2. Check for GZIP (Magic: 1f 8b)
+    if content.startswith(b'\x1f\x8b'):
+        print("DETECTED: GZIP data (manual)")
+        return gzip.decompress(content).decode('utf-8')
+
+    # 3. Check for BROTLI (if server ignored us and sent 'br' anyway)
+    # Note: We can only do this if the user has the 'brotli' package.
+    if response.headers.get('Content-Encoding') == 'br':
+        try:
+            import brotli
+            print("DETECTED: Brotli data (using 'brotli' lib)")
+            return brotli.decompress(content).decode('utf-8')
+        except ImportError:
+            print("ERROR: Server sent Brotli (br) but 'brotli' pip package is missing.")
+            print("FALLBACK: Attempting to use system CURL...")
+            return fetch_with_curl(response.url)
+
+    return response.text
+
+def fetch_with_curl(url):
+    """
+    Last resort: Use system 'curl' which usually handles compression transparently.
+    """
+    if not shutil.which("curl"):
+        raise Exception("CURL not found on system and Brotli decode failed.")
+        
+    try:
+        print(f"Executing CURL for {url}...")
+        # -s: Silent, -L: Follow redirects, --compressed: Handle gzip/brotli
+        result = subprocess.run(
+            ["curl", "-s", "-L", "--compressed", "-A", HEADERS['User-Agent'], url],
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+        return result.stdout
+    except Exception as e:
+        print(f"CURL failed: {e}")
+        return ""
 
 def extract_data_from_html(html_content):
     """Parses HTML content (from RSS or Web) to find Image and Clues."""
+    if not html_content: return None, {"across": {}, "down": {}}
+
     soup = BeautifulSoup(html_content, 'html.parser')
     
     # --- 1. FIND IMAGE ---
     image_url = None
     candidates = []
     
-    # Find all images
     for img in soup.find_all('img'):
         src = img.get('src') or img.get('data-src')
         if not src or 'pixel' in src or 'icon' in src: continue
         
-        # Score candidates
         score = 0
         if 'grid' in src.lower() or 'crossword' in src.lower(): score += 50
         width = int(img.get('width') or 0)
@@ -30,13 +93,16 @@ def extract_data_from_html(html_content):
         
         candidates.append((score, src))
     
-    # Pick best image
     candidates.sort(key=lambda x: x[0], reverse=True)
     if candidates:
         image_url = candidates[0][1]
 
     # --- 2. FIND CLUES ---
     clues = {"across": {}, "down": {}}
+    
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+        
     text_content = soup.get_text("\n")
     lines = text_content.split("\n")
     
@@ -60,32 +126,46 @@ def extract_data_from_html(html_content):
     return image_url, clues
 
 def get_latest_puzzle():
-    print("--- STARTING SCRAPE (RSS STRATEGY) ---")
+    print("--- STARTING SCRAPE (IE11 + CURL STRATEGY) ---")
     
     try:
-        # 1. Fetch RSS Feed
         rss_url = "https://nyxcrossword.com/feed"
         print(f"Fetching RSS: {rss_url}")
-        res = requests.get(rss_url, headers=HEADERS, timeout=10)
-        res.raise_for_status()
         
-        # 2. Parse XML
-        # We use 'xml' parser if available, else fallback
+        payload_text = ""
+        
         try:
-            feed_soup = BeautifulSoup(res.content, 'xml')
+            res = requests.get(rss_url, headers=HEADERS, timeout=15)
+            print(f"Status: {res.status_code}, Encoding: {res.headers.get('Content-Encoding')}")
+            
+            if res.status_code == 200:
+                payload_text = decode_content(res)
+        except Exception as e:
+            print(f"Requests failed ({e}). Trying CURL...")
+        
+        # Fallback to CURL if requests failed or returned empty/garbage
+        if not payload_text or not payload_text.strip().startswith("<"):
+            payload_text = fetch_with_curl(rss_url)
+
+        # Validate XML
+        if not payload_text or not payload_text.strip().startswith("<"):
+            return {"error": "Failed to retrieve valid XML data."}
+
+        # 2. Parse XML
+        try:
+            feed_soup = BeautifulSoup(payload_text, 'xml')
         except:
-            feed_soup = BeautifulSoup(res.content, 'html.parser')
+            feed_soup = BeautifulSoup(payload_text, 'html.parser')
             
         item = feed_soup.find('item')
         if not item:
-            return {"error": "RSS Feed fetched but empty."}
+            return {"error": "RSS Feed parsed but empty (no <item>)."}
 
         title = item.find('title').get_text()
         print(f"Latest Post: {title}")
 
-        # 3. Extract Content from RSS
-        # WordPress/Blogspot puts full HTML in <content:encoded> or <description>
-        content_encoded = item.find('content:encoded')
+        # 3. Extract Content
+        content_encoded = item.find('content:encoded') or item.find('encoded') or item.find('content')
         description = item.find('description')
         
         html_payload = ""
@@ -95,10 +175,16 @@ def get_latest_puzzle():
             html_payload = description.get_text()
             
         if not html_payload:
-            print("RSS had no content body. Fallback to scraping URL (likely to fail if blocked).")
+            print("RSS body empty. Scraping link directly...")
             post_url = item.find('link').get_text()
+            
+            # Try fetching post with Requests
             res_page = requests.get(post_url, headers=HEADERS)
-            html_payload = res_page.text
+            html_payload = decode_content(res_page)
+            
+            # Retry with CURL if needed
+            if not html_payload or not html_payload.strip().startswith("<"):
+                html_payload = fetch_with_curl(post_url)
 
         # 4. Parse the Payload
         image_url, clues = extract_data_from_html(html_payload)
@@ -117,5 +203,6 @@ def get_latest_puzzle():
         }
 
     except Exception as e:
+        print("CRITICAL SCRAPER ERROR:")
         print(traceback.format_exc())
         return {"error": str(e)}

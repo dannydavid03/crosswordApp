@@ -1,9 +1,45 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
+
+@theme {
+  --font-sans: 'Inter', sans-serif;
+  --font-serif: 'Libre Baskerville', serif;
+
+  --animate-shake: shake 0.3s ease-in-out;
+}
+
+@keyframes shake {
+
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+
+  25% {
+    transform: translateX(-5px);
+  }
+
+  75% {
+    transform: translateX(5px);
+  }
+}
 
 /* Smooth scrolling for clue list */
 .clue-scroll {
   scrollbar-width: thin;
   scrollbar-color: #cbd5e1 transparent;
+  scroll-behavior: smooth;
+}
+
+.clue-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.clue-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.clue-scroll::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 20px;
 }
